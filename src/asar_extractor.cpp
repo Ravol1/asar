@@ -265,6 +265,26 @@ namespace asar {
 
 			fs::path new_path = current_path / name_u8;
 
+
+			// Prevent path traversal attacks: ensure new_path resolves to a location
+			// inside current_path. weakly_canonical resolves ".." without requiring the
+			// path to exist; mismatch then walks both iterator ranges and stops at the
+			// first differing component. If the canonical destination is not fully
+			// consumed (a != end), new_path escapes the intended root.
+			fs::path canonical_dest = fs::weakly_canonical(current_path);
+			fs::path canonical_new  = fs::weakly_canonical(new_path);
+
+			auto [a, b] = std::mismatch(
+			canonical_dest.begin(), canonical_dest.end(),
+			canonical_new.begin(), canonical_new.end()
+			);
+
+			if (a != canonical_dest.end()) {
+				throw std::runtime_error("Path traversal detected: " + new_path.string());
+			}
+
+
+
 			if (value.contains("files")) {
 				// Directory node: ensure the directory exists, then recurse.
 				fs::create_directories(new_path);
