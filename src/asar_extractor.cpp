@@ -14,6 +14,12 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#ifndef WIN32
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -28,10 +34,10 @@ namespace asar {
 	 *
 	 * @throws std::logic_error if the archive has not been opened yet.
 	 */
-	std::span<const uint8_t> extractor::buff() {
+	std::span<const uint8_t> extractor::file_data() const {
 		if (!_is_open) throw std::logic_error("Archive not open");
 
-		return std::span(_buff);
+		return {_file_data, _file_size};
 	}
 
 
@@ -155,24 +161,24 @@ namespace asar {
 	 * @brief Returns a span over the raw bytes of a single file entry.
 	 *
 	 * Reads the "offset" (stored as a decimal string per ASAR spec) and "size"
-	 * (stored as an integer) from @p json_node, then slices the corresponding
+	 * (stored as an integer) from @p file_node, then slices the corresponding
 	 * region out of _data.
 	 *
-	 * @param json_node  Pointer to a file entry node in the metadata tree.
+	 * @param file_node  Pointer to a file entry node in the metadata tree.
 	 * @return           A read-only span over the file's bytes inside _data.
-	 * @throws std::logic_error    if the archive is not open, or if @p json_node
+	 * @throws std::logic_error    if the archive is not open, or if @p file_node
 	 *                             is missing "size" or "offset".
 	 * @throws std::runtime_error  if "offset" is not a string, if "size" is not
 	 *                             an integer, or if the string-to-number
 	 *                             conversion fails.
 	 */
-	std::span<const uint8_t> extractor::get_file_data(const json* json_node) {
+	std::span<const uint8_t> extractor::get_file_data(const json* file_node) {
 		if (!_is_open) throw std::logic_error("Archive not open.");
-		if (!(json_node->contains("size") && json_node->contains("offset")))
+		if (!(file_node->contains("size") && file_node->contains("offset")))
 			throw std::logic_error("Invalid file entry.");
 
-		const json* offset_node = &(*json_node)["offset"];
-		const json* size_node = &(*json_node)["size"];
+		const json* offset_node = &(*file_node)["offset"];
+		const json* size_node = &(*file_node)["size"];
 		size_t offset;
 		size_t size;
 
@@ -211,11 +217,11 @@ namespace asar {
 	 * @param path       Destination path on disk (parent directory must exist).
 	 *
 	 * @throws std::runtime_error  if the destination file cannot be opened,
-	 *                             if the write is incomplete, or if fclose fails.
+	 *                             if writing is incomplete, or if fclose fails.
 	 */
 	void extractor::extract_file(const json* file_node, const fs::path& path) {
-		std::span file_data = get_file_data(file_node);
-		size_t bytes = file_data.size();
+		const std::span file_data = get_file_data(file_node);
+		const size_t bytes = file_data.size();
 
 
 		// Platform-specific open: _wfopen_s on Windows for wide-character paths.
@@ -344,12 +350,15 @@ namespace asar {
 		if (_is_open) throw std::logic_error("Archive already open.");
 
 
+#ifdef _WIN32
 		std::intmax_t tot_size = 0;
+
 
 		std::ifstream file;
 		file.open(filepath, std::ios::in | std::ios::binary);
 
-		if (!file.is_open()) throw std::runtime_error("Unable to open file at: " + filepath.string() + ". Does it exist?");
+		if (!file.is_open())
+			throw std::runtime_error("Unable to open file at: " + filepath.string() + ". Does it exist?");
 
 
 		// Determine file size by seeking to the end, then rewind.
@@ -359,35 +368,61 @@ namespace asar {
 
 
 		// Read the entire file into _buff in one call.
-		_buff = std::vector<uint8_t>(tot_size);
-		if (!file.read(reinterpret_cast<char*>(_buff.data()), tot_size)) throw std::runtime_error("Read error.");
+		_file_data = new uint8_t[tot_size];
+
+		if (!file.read(reinterpret_cast<char*>(_file_data), tot_size)) throw std::runtime_error("Read error.");
 		file.close();
 
-		size_t size = _buff.size();
+		_file_size = tot_size;
+#else
+		const int fd = ::open(filepath.c_str(), O_RDONLY);
+		if (fd == -1)
+			throw std::system_error(errno, std::generic_category(), "open");
+
+
+		struct stat st{};
+		::fstat(fd, &st);
+		if (::fstat(fd, &st) == -1) {
+			::close(fd);
+			throw std::system_error(errno, std::generic_category(), "fstat");
+		}
+
+		_file_size = st.st_size;
+
+		_file_data = static_cast<uint8_t*>(
+			mmap(nullptr, _file_size, PROT_READ, MAP_PRIVATE, fd, 0));
+
+		::close(fd);
+
+		if (_file_data == MAP_FAILED)
+			throw std::runtime_error("mmap error.");
+
+
+#endif
 
 
 		// Validate the binary header
 		AsarHeader header{};
-		if (size < sizeof(AsarHeader)) throw std::runtime_error("Wrong file format");
+		if (_file_size < sizeof(AsarHeader)) throw std::runtime_error("Wrong file format");
 
-		std::memcpy(&header, _buff.data(), sizeof(AsarHeader));
+		std::memcpy(&header, _file_data, sizeof(AsarHeader));
 
 		if (!check_header(header)) throw std::runtime_error("Wrong file format.");
 
 
 		// Read JSON string
 		const size_t json_size = header.json_size;
-		_json_string = std::string_view(reinterpret_cast<const char*>(_buff.data()) + sizeof(AsarHeader), json_size);
+		_json_string = std::string_view(reinterpret_cast<const char*>(_file_data) + sizeof(AsarHeader), json_size);
 
 
 		// The JSON block is stored with 4-byte alignment (Electron pickle format).
 		// Round json_size up to the next multiple of 4 to find where file data begins.
-		size_t data_start_offset = sizeof(AsarHeader) + (header.json_size + 3) / 4 * 4;
+		const size_t data_start_offset = sizeof(AsarHeader) + (header.json_size + 3) / 4 * 4;
 
 
 		// Expose the raw file-data blob
-		size_t data_size = size - data_start_offset;
-		_data = std::span<const uint8_t>(_buff.data() + data_start_offset, data_size);
+		size_t data_size = _file_size - data_start_offset;
+		_data = std::span<const uint8_t>(_file_data + data_start_offset, data_size);
 
 
 		// Parse JSON
@@ -416,7 +451,13 @@ namespace asar {
 	void extractor::close() {
 		if (!_is_open) return;
 
-		_buff.clear(); _buff.shrink_to_fit();	// release heap memory, not just logical size
+#ifdef WIN32
+		delete[] _file_data;
+#else
+		munmap(const_cast<uint8_t*>(_file_data), _file_size);
+#endif
+		_file_data = nullptr;
+		_file_size = 0;
 
 		_data = {};				// span reset (no ownership to release)
 		_json_string = {};		// string_view reset (no ownership to release)
