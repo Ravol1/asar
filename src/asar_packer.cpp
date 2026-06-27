@@ -17,6 +17,16 @@
 #include <fstream>
 #include <openssl/evp.h>
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+
+
+
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -67,8 +77,7 @@ namespace asar {
 	 * @brief Returns the full JSON metadata object.
 	 * @throws std::logic_error if the archive has not been opened yet.
 	 */
-	json packer::metadata()
-	{
+	json packer::metadata() {
 		if (!_is_open) throw std::logic_error("Archive not open");
 
 		return _metadata;
@@ -235,6 +244,10 @@ namespace asar {
 	 * @param current_path  Directory on disk to enumerate.
 	 */
 	void packer::construct_metadata(json* node, const fs::path& current_path) {
+		// SHA-256 produces a 32-byte (256-bit) hash, represented as a 64-character hexadecimal string
+		const auto placeholder_hash = std::string(64, '0');
+
+
 		// Use a sorted map to guarantee alphabetical ordering in the output.
 		std::map<std::string, fs::path> dir_map;
 
@@ -265,14 +278,20 @@ namespace asar {
 
 				uint64_t size = fs::file_size(entry_path);
 
-				(*next_node)["offset"] = std::to_string(tot_offset);
+				(*next_node)["offset"] = std::to_string(_data_size);
 				(*next_node)["size"] = size;
 
 				json* integrity = &(*next_node)["integrity"];
 				(*integrity)["algorithm"] = "SHA256";
-				(*integrity)["hash"] = "";				// filled by construct_data()
+				(*integrity)["hash"] = placeholder_hash;	// placeholder, filled by construct_data()
 				(*integrity)["blockSize"] = BLOCK_SIZE;
 				(*integrity)["blocks"] = json::array();		// filled by construct_data()
+
+
+				const auto block_number = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+				for (int i = 0; i < block_number; i++) {
+					(*integrity)["blocks"][i] = placeholder_hash;
+				}
 
 
 				// Register the file so construct_data() can read it, hash it
@@ -280,13 +299,13 @@ namespace asar {
 				FileTask file_task;
 				file_task.path = entry_path;
 				file_task.size = size;
-				file_task.offset = tot_offset;
+				file_task.offset = _data_size;
 				file_task.node = next_node;
 
 				file_tasks.push_back(file_task);
 
 				// Advance the write cursor past this file's region in _data.
-				tot_offset += size;
+				_data_size += size;
 			}
 		}
 	}
@@ -294,48 +313,117 @@ namespace asar {
 
 
 	/**
-	 * @brief Opens a directory and builds the complete in-memory ASAR archive.
+	 * @brief Opens a directory and prepares it for packing into an ASAR archive.
 	 *
-	 * Steps performed:
-	 *   1. construct_metadata() – walks the directory tree and builds the JSON
-	 *      header, recording file offsets and populating file_tasks.
-	 *   2. Allocates _data to the total byte size of all files and populate it with construct_data().
-	 *   3. Serializes _metadata to _json_string.
-	 *   4. Fills in the binary AsarHeader fields (see AsarHeader docs):
-	 *        - signature  : always 0x04 (Electron's pickle protocol marker).
-	 *        - json_size  : byte length of the serialized JSON string.
-	 *        - pickle2    : JSON size rounded up to a 4-byte boundary, plus 4.
-	 *        - pickle3    : pickle2 + 4 (outer pickle size field).
+	 * Walks the given directory to build a JSON metadata tree, computes the
+	 * archive layout (header + JSON block + raw data blob), and memory-maps
+	 * (POSIX) or heap-allocates (Windows) the output buffer. File data is then
+	 * written into the buffer via construct_data(). The final JSON string
+	 * (which now includes hashes) is stored for later use by save().
 	 *
-	 * @param dir  Path to the root directory to archive.
-	 * @throws std::logic_error  if an archive is already open, or if @p dir
-	 *                           does not exist.
+	 * @param dir        Source directory to pack.
+	 * @param save_dest  Destination file path; used on POSIX to create and
+	 *                   size the output file before mmap-ing it.
+	 * @throws std::logic_error    if the archive is already open, or if
+	 *                             @p dir does not exist.
+	 * @throws std::system_error   if open(2), ftruncate(2), or fstat(2) fail
+	 *                             (POSIX only).
+	 * @throws std::runtime_error  if mmap(2) fails (POSIX only).
 	 */
-	void packer::open(const fs::path& dir) {
+	void packer::open(const fs::path& dir, const fs::path& save_dest) {
 		if (_is_open) throw std::logic_error("Archive already open");
 		if (!fs::exists(dir)) throw std::logic_error("Directory does not exist");
 
-		root = dir;
+		_root = dir;
 
 
-		// Step 1: build metadata tree and record all file tasks.
+		// Recurse through the directory tree, populating _metadata["files"]
+		// with per-file entries (path, size, offset) and accumulating _data_size.
 		construct_metadata(&_metadata["files"], dir);
 
 
-		// Step 2: allocate flat output buffer and fill it with file contents.
-		_data = std::vector<uint8_t>(tot_offset);
+		// Save temporary JSON string without hashes.
+		const auto json_string_tmp = _metadata.dump();
+
+
+
+		// Fill in the fixed AsarHeader fields:
+		//   signature  – magic byte expected by Electron's asar reader.
+		//   json_size  – raw byte length of the JSON metadata string.
+		//   pickle2    – json_size rounded up to the next 4-byte boundary, plus
+		//                the 4-byte pickle size prefix; this is the total size of
+		//                the JSON block as seen by Electron's pickle reader.
+		//   pickle3    – pickle2 + 4
+		header.signature = 0x04;
+		header.json_size = json_string_tmp.size();
+		header.pickle2 = (header.json_size + 3) / 4 * 4 + 4;
+		header.pickle3 = header.pickle2 + 4;
+
+
+		// Compute absolute offsets within the output buffer:
+		//   json_offset  – immediately after the fixed AsarHeader struct.
+		//   data_offset  – immediately after the padded JSON block.
+		//   _tot_size    – total byte length of the final archive file.
+		constexpr auto json_offset = sizeof(AsarHeader);
+		const auto data_offset = json_offset + header.pickle2;
+		_tot_size = sizeof(AsarHeader) + header.pickle2 + _data_size;
+
+
+#ifdef _WIN32
+		// Windows: allocate the entire archive in a heap buffer; _data is a
+		// span over the file-data region at the end of that buffer.
+
+
+		_file_data = new[tot_size];
+		_data = std::span(_file_data + data_offset, _data_size);
+#else
+		// POSIX: create (or truncate) the destination file, extend it to the
+		// final archive size, then mmap the whole file read-write so that
+		// construct_data() can write directly into it without extra copies.
+
+
+		const int fd = ::open(save_dest.c_str(), O_RDWR | O_CREAT, 0644);
+		if (fd == -1)
+			throw std::system_error(errno, std::generic_category(), "open");
+
+		// Pre-allocate the exact number of bytes the finished archive will need.
+		if (ftruncate(fd, static_cast<__off_t>(_tot_size)) == -1)
+			throw std::system_error(errno, std::generic_category(), "ftruncate");
+
+		struct stat st{};
+
+		if (::fstat(fd, &st) == -1) {
+			::close(fd);
+			throw std::system_error(errno, std::generic_category(), "fstat");
+		}
+
+		// Map the file into the address space
+		_file_data = static_cast<uint8_t*>(
+			mmap(nullptr, _tot_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+		);
+
+		// The fd is no longer needed once the mapping is established.
+		::close(fd);
+
+		if (_file_data == MAP_FAILED)
+			throw std::runtime_error("mmap error.");
+
+
+		// _data is a span over only the file-data region of the mapped buffer,
+		// keeping header/JSON writes separate from raw file content writes
+		_data = std::span(_file_data + data_offset, _data_size);
+
+#endif
+
+		// Copy all source files into the mapped/allocated buffer and update
+		// each metadata entry with the computed SHA-256 hash.
 		construct_data();
 
 
-		// Step 3: serialise metadata to JSON string.
+		// Re-serialize the metadata now that construct_data() has filled in file hashes;
+		// this is the string that will actually be written to disk.
 		_json_string = _metadata.dump();
 
-
-		// Phase 4: populate the binary header.
-		header.signature = 0x04;
-		header.json_size = _json_string.size();
-		header.pickle2 = (header.json_size + 3) / 4 * 4 + 4;
-		header.pickle3 = header.pickle2 + 4;
 
 		_is_open = true;
 	}
@@ -351,21 +439,29 @@ namespace asar {
 	void packer::close() {
 		if (!_is_open) return;
 
-		tot_offset = 0;
+#ifdef _WIN32
+		delete[] _file_data;
+#else
+		// Unmap the memory-mapped file region; this also flushes any dirty
+		// pages back to the underlying file before the mapping is removed.
+		munmap(_file_data, _tot_size);
+#endif
+		_file_data = nullptr;
+		_data_size = 0;
 
 
-		// Free JSON memory: clear(), swap with empty, then assign null.
+		// Release JSON object memory in three steps: clear internal nodes,
+		// swap with a default-constructed (empty) JSON to release heap storage,
+		// then assign null so the object is in a well-defined empty state.
 		_metadata.clear();
 		json().swap(_metadata);
 		_metadata = nullptr;
 
 
-		// Shrink string and vector back to zero capacity.
+		// Release the serialized JSON string's heap allocation entirely rather
+		// than just setting size to zero (clear() alone may retain capacity).
 		_json_string.clear();
 		_json_string.shrink_to_fit();
-		_data.clear();
-		_data.shrink_to_fit();
-
 
 		_is_open = false;
 	}
@@ -390,35 +486,44 @@ namespace asar {
 	 * @throws std::runtime_error  if the output file cannot be created.
 	 */
 	void packer::save(const fs::path& path) {
+#ifdef _WIN32
 		if (!_is_open) throw std::logic_error("Archive not open");
+
 
 		std::ofstream file(path, std::ios::out | std::ios::binary);
 
 		if (!file) throw std::runtime_error("Unable to open file " + path.string());
 
 
-		// Binary header.
+		// Fixed-size binary header (signature, sizes, offsets).
 		file.write(reinterpret_cast<char*>(&header), sizeof(AsarHeader));
 
-		// JSON metadata string (no null terminator – length is in header).
+		// Raw JSON metadata string (no null terminator; length is encoded in
+		// the header so Electron knows exactly how many bytes to read)
 		file.write(
 			_json_string.data(),
 			static_cast<std::streamsize>(_json_string.size()));
 
 
-		// NUL padding to align the end of the header region to 4 bytes.
-		// pickle2 already encodes the padded size; subtract json_size and
-		// the 4-byte json_size prefix to find how many pad bytes are needed.
+		// NUL padding so the JSON block ends on a 4-byte boundary.
+		// pickle2 = json_size_prefix(4) + json_size rounded up to 4 bytes,
+		// so pad_size = pickle2 - json_size - 4 gives 0–3 bytes of padding
 		if (const uint32_t pad_size = header.pickle2 - header.json_size - 4; pad_size > 0) {
 			constexpr char padding[3] = { 0, 0, 0 };
 			file.write(padding, pad_size);
 		}
 
-		// 4. Raw concatenated file data.
-		file.write(
-			reinterpret_cast<char*>(_data.data()),
-			static_cast<std::streamsize>(_data.size()));
-
 		file.close();
+#else
+		// POSIX: the output file is already mmap-ed and fully populated.
+		// Only the header and JSON string need to be stamped in; file data was
+		// written directly into the mapped region during construct_data().
+		// Padding bytes are implicitly zero because ftruncate() zero-fills the
+		// file on creation, so no explicit pad write is required here.
+
+
+		memcpy(_file_data, &header, sizeof(AsarHeader));
+		memcpy(_file_data + sizeof(AsarHeader), _json_string.data(), _json_string.size());
+#endif
 	}
 } // namespace asar

@@ -22,7 +22,7 @@ void test() {
 	original.close();
 
 	std::cout << "Repacking" << std::endl;
-	asar::packer repacked(extracted_path);
+	asar::packer repacked(extracted_path, repacked_archive_name);
 	std::cout << "Saving repacked archive" << std::endl;
 	repacked.save(repacked_archive_name);
 	repacked.close();

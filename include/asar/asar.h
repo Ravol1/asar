@@ -93,8 +93,8 @@ namespace asar {
 		bool _is_open = false;
 
 
-		uint8_t* _file_data;					// Raw archive buffer: ASAR header + JSON header (metadata) + data
-		size_t _file_size;						// Size of the opened file in bytes
+		uint8_t* _file_data = nullptr;			// Raw archive buffer: ASAR header + JSON header (metadata) + data
+		size_t _file_size = 0;					// Size of the opened file in bytes
 
 		std::string_view _json_string;			// JSON metadata as string view
 		std::span<const uint8_t> _data;			// Binary data blob of archive
@@ -123,10 +123,10 @@ namespace asar {
 		std::span<const uint8_t> data();	// Packed binary data buffer
 		json metadata();					// Parsed metadata object
 
-		void open(const fs::path& dir);
+		void open(const fs::path& dir, const fs::path& save_dest);
 		void close();
 
-		explicit packer(const fs::path& path) { open(path); };
+		explicit packer(const fs::path& path, const fs::path& save_dest) { open(path, save_dest); };
 		packer() = default;
 
 		void save(const fs::path& path);
@@ -135,16 +135,18 @@ namespace asar {
 	private:
 		bool _is_open = false;
 
+		size_t _tot_size = 0;
 
-		fs::path root;					// Root directory being packed
-		uint64_t tot_offset = 0;		// Running offset in packed data
+		fs::path _root;					// Root directory being packed
+		uint64_t _data_size = 0;		// Running offset in packed data
 
 		json _metadata;					// Parsed metadata object
 
+		uint8_t* _file_data = nullptr;
 
 		AsarHeader header{};			// Constructed header for the output archive
 		std::string _json_string;		// JSON metadata as string view
-		std::vector<uint8_t> _data;		// Packed binary data buffer
+		std::span<uint8_t> _data;		// Packed binary data buffer
 
 
 		std::vector<FileTask> file_tasks;	// Queue of files to pack
