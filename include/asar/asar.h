@@ -66,9 +66,16 @@ namespace asar {
 		[[nodiscard]]
 		bool is_open() const { return _is_open; }
 
+		[[nodiscard]]
 		std::span<const uint8_t> file_data() const;			// Raw archive buffer: ASAR header + JSON header (metadata) + data
+
+		[[nodiscard]]
 		std::string_view json_string() const;		// JSON metadata as string view
+
+		[[nodiscard]]
 		std::span<const uint8_t> data() const;		// Binary data blob of archive
+
+		[[nodiscard]]
 		json metadata();							// Parsed JSON metadata tree
 
 		void open(const fs::path& filepath);
@@ -118,10 +125,15 @@ namespace asar {
 	public:
 		[[nodiscard]]
 		bool is_open() const { return _is_open; }
-		
-		std::string_view json_string();		// JSON metadata serialized as string
-		std::span<const uint8_t> data();	// Packed binary data buffer
-		json metadata();					// Parsed metadata object
+
+		[[nodiscard]]
+		std::string_view json_string();					// JSON metadata serialized as string
+
+		[[nodiscard]]
+		 std::span<const uint8_t> data() const;			// Packed binary data buffer
+
+		[[nodiscard]]
+		json metadata();								// Parsed metadata object
 
 		void open(const fs::path& dir, const fs::path& save_dest);
 		void close();

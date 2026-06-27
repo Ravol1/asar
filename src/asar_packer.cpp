@@ -65,7 +65,7 @@ namespace asar {
 	 *
 	 * @throws std::logic_error if the archive has not been opened yet.
 	 */
-	std::span<const uint8_t> packer::data() {
+	std::span<const uint8_t> packer::data() const {
 		if (!_is_open) throw std::logic_error("Archive not open");
 
 		return _data;

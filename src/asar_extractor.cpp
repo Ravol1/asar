@@ -14,12 +14,15 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
-#ifndef WIN32
+
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+
+
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -349,7 +352,6 @@ namespace asar {
 	void extractor::open(const fs::path& filepath) {
 		if (_is_open) throw std::logic_error("Archive already open.");
 
-
 #ifdef _WIN32
 		std::intmax_t tot_size = 0;
 
@@ -381,7 +383,6 @@ namespace asar {
 
 
 		struct stat st{};
-		::fstat(fd, &st);
 		if (::fstat(fd, &st) == -1) {
 			::close(fd);
 			throw std::system_error(errno, std::generic_category(), "fstat");
@@ -396,10 +397,7 @@ namespace asar {
 
 		if (_file_data == MAP_FAILED)
 			throw std::runtime_error("mmap error.");
-
-
 #endif
-
 
 		// Validate the binary header
 		AsarHeader header{};
@@ -421,7 +419,7 @@ namespace asar {
 
 
 		// Expose the raw file-data blob
-		size_t data_size = _file_size - data_start_offset;
+		const size_t data_size = _file_size - data_start_offset;
 		_data = std::span<const uint8_t>(_file_data + data_start_offset, data_size);
 
 
